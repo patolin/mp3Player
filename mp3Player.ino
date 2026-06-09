@@ -1,5 +1,5 @@
 // ============================================================
-// CYD Album Player (by folders) - Functional sketch
+// pato MP3 player. WIP
 // ============================================================
 
 #include <Arduino.h>
@@ -250,18 +250,15 @@ static int32_t btCallback(Frame *frame, int32_t count) {
 
 class RingBufOutput : public AudioOutput {
 public:
-  float gain = 0.7f;
   bool begin() override { return true; }
   bool stop()  override { return true; }
   bool ConsumeSample(int16_t sample[2]) override {
     size_t next = (rbHead + 1) % RING_SIZE;
     if (next == rbTail) return false;
-    int32_t l = (int32_t)(sample[0] * gain);
-    int32_t r = (int32_t)(sample[1] * gain);
-    ring[rbHead * 2]     = constrain(l, -32768, 32767);
-    ring[rbHead * 2 + 1] = constrain(r, -32768, 32767);
+    ring[rbHead * 2]     = sample[0];
+    ring[rbHead * 2 + 1] = sample[1];
     rbHead = next;
-    visRing[visWritePos & (VIS_BUF_LEN - 1)] = (int16_t)((l + r) >> 1);
+    visRing[visWritePos & (VIS_BUF_LEN - 1)] = (int32_t)((sample[0] + sample[1] ) >> 1);
     visWritePos++;
     return true;
   }
@@ -655,7 +652,6 @@ static int           volumePercent      = 30;
 
 static void applyVolumePercent() {
   volumePercent = constrain(volumePercent, 0, 100);
-  if (audioOut) audioOut->gain = (float)volumePercent / 100.0f;
   a2dp.set_volume((int)((volumePercent * 127) / 100));
 }
 
@@ -1041,7 +1037,6 @@ static void handleTouch() {
 
 // ── Setup / Loop ────────────────────────────────────────────
 void setup() {
-  Serial.begin(115200);
   delay(500);
 
   rgbLedInit();
@@ -1076,7 +1071,6 @@ void setup() {
   }
 
   audioOut = new RingBufOutput();
-  audioOut->gain = 0.7f;
   applyVolumePercent();
 
   drawStartupScreen();
@@ -1084,7 +1078,7 @@ void setup() {
   // Always show device picker on boot (no auto-reconnect to a previously saved speaker).
   a2dp.set_auto_reconnect(false);
   a2dp.clean_last_connection();
-  a2dp.set_volume(127);
+  a2dp.set_volume(64);
   a2dp.set_data_callback_in_frames(btCallback);
   a2dp.set_ssid_callback(btScanSsidCallback);
   a2dp.start();
