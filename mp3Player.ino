@@ -10,6 +10,7 @@
 #include <SPI.h>
 #include <TFT_eSPI.h>
 #include <XPT2046_Touchscreen.h>
+#include <lvgl.h>
 #include <math.h>
 
 #include <AudioFileSourceSD.h>
@@ -19,6 +20,7 @@
 
 #include "BluetoothA2DPSource.h"
 #include "esp_gap_bt_api.h"
+#include "esp_heap_caps.h"
 #include "freertos/portmacro.h"
 #include "ui_strings.h"
 
@@ -62,6 +64,30 @@ XPT2046_Touchscreen ts(TOUCH_CS, TOUCH_IRQ);
 // Portrait dimensions (240x320)
 static const int SCR_W = 240;
 static const int SCR_H = 320;
+
+// 0 = do not decode/show JPG covers (safer, lower RAM); 1 = enable JPG cover art.
+#define ENABLE_JPG_COVER 0
+// 1 = bypass LVGL fully and use a minimal TFT-only status UI.
+#define SAFE_MODE_TFT_ONLY 0
+// Emits breadcrumb traces for normal UI bring-up and redraw paths.
+#define UI_DEBUG_BREADCRUMBS 1
+// 1 = conservative A2DP init order (avoids known null-deref issues in some lib builds).
+#define A2DP_CONSERVATIVE_INIT 1
+// 1 = initialize LVGL only after Bluetooth is connected.
+#define LVGL_INIT_AFTER_BT 1
+// 1 = use inquiry/picker callback flow for new pairing (less stable on some builds).
+#define BT_USE_DEVICE_PICKER 0
+
+static void mainTrace(const char* tag) {
+#if UI_DEBUG_BREADCRUMBS
+  Serial.print("[MAIN] ");
+  Serial.print((unsigned long)millis());
+  Serial.print(' ');
+  Serial.println(tag);
+#else
+  (void)tag;
+#endif
+}
 
 // Player screen (DAP-style) — portrait layout
 static const int PL_HEADER_H       = 38;
@@ -161,6 +187,8 @@ static uint8_t     btChosenAddr[ESP_BD_ADDR_LEN];
 
 BluetoothA2DPSource a2dp;
 static bool btConnected = false;
+static bool a2dpStarted = false;
+static bool uiReadyForPicker = false;
 /** Short label for HUD after connection (from remote name). */
 static char btPeerDisplayName[BT_NAME_BUF] = "";
 
@@ -170,8 +198,14 @@ static bool btAddrEquals(const uint8_t* a, const uint8_t* b) {
 
 /** Called from BT stack during inquiry; add unique devices, optionally accept chosen one. */
 static bool btScanSsidCallback(const char* ssid, esp_bd_addr_t address, int rssi) {
+  (void)ssid;
   bool accept = false;
   portENTER_CRITICAL(&btScanMux);
+
+  if (!address) {
+    portEXIT_CRITICAL(&btScanMux);
+    return false;
+  }
 
   bool duplicate = false;
   for (int i = 0; i < btScanCount; i++) {
@@ -183,11 +217,9 @@ static bool btScanSsidCallback(const char* ssid, esp_bd_addr_t address, int rssi
   if (!duplicate && btScanCount < BT_SCAN_MAX) {
     BtScanEntry* e = &btScanList[btScanCount++];
     memset(e, 0, sizeof(*e));
-    if (ssid && ssid[0]) {
-      strncpy(e->name, ssid, sizeof(e->name) - 1);
-    } else {
-      strncpy(e->name, STR_BT_NO_NAME, sizeof(e->name) - 1);
-    }
+    // Some library builds can provide transient name pointers during inquiry.
+    // Keep scan callback pointer-safe by using a stable fallback label.
+    strncpy(e->name, STR_BT_NO_NAME, sizeof(e->name) - 1);
     e->name[sizeof(e->name) - 1] = '\0';
     memcpy(e->addr, address, ESP_BD_ADDR_LEN);
     e->rssi = rssi;
@@ -196,6 +228,19 @@ static bool btScanSsidCallback(const char* ssid, esp_bd_addr_t address, int rssi
   if (btUserHasChoice && memcmp(address, btChosenAddr, ESP_BD_ADDR_LEN) == 0) {
     accept = true;
   }
+
+#if SAFE_MODE_TFT_ONLY
+  if (!btUserHasChoice && btScanCount > 0) {
+#else
+  if (!uiReadyForPicker && !btUserHasChoice && btScanCount > 0) {
+#endif
+    memcpy(btChosenAddr, address, ESP_BD_ADDR_LEN);
+    btUserHasChoice = true;
+    accept = true;
+    strncpy(btPeerDisplayName, STR_BT_LABEL, sizeof(btPeerDisplayName) - 1);
+    btPeerDisplayName[sizeof(btPeerDisplayName) - 1] = '\0';
+  }
+
   portEXIT_CRITICAL(&btScanMux);
   return accept;
 }
@@ -208,38 +253,58 @@ static int btScanCountSnapshot() {
 }
 
 // ── Ring buffer for A2DP audio ────────────────────────────
-#define RING_SIZE 4096
-static int16_t ring[RING_SIZE * 2];
+#define RING_SIZE_DEFAULT 4096
+static int16_t* ring = nullptr;
+static size_t ringCapacity = 0;
 static volatile size_t rbHead = 0;
 static volatile size_t rbTail = 0;
 
 static inline size_t rbAvail() {
+  if (ringCapacity == 0) return 0;
   size_t h = rbHead, t = rbTail;
-  return (h >= t) ? (h - t) : (RING_SIZE - t + h);
+  return (h >= t) ? (h - t) : (ringCapacity - t + h);
 }
 
-// Mono samples for visualizer (per-band Goertzel)
-#define VIS_BUF_LEN 512
-#define VIS_N       256
-#define NUM_VIS_BARS 16
-static int16_t visRing[VIS_BUF_LEN];
-static volatile uint32_t visWritePos = 0;
-static float visBandVal[NUM_VIS_BARS];
-/** Slow per-band envelope (independent AGC — keeps bass from masking treble). */
-static float visBandEnv[NUM_VIS_BARS];
+static bool initAudioRingBuffer() {
+  if (ring && ringCapacity > 0) return true;
 
-static const float VIS_FREQ_HZ[NUM_VIS_BARS] = {
-  80.f, 125.f, 200.f, 320.f, 500.f, 800.f, 1250.f, 2000.f,
-  3000.f, 4500.f, 6000.f, 8000.f, 10000.f, 12000.f, 15000.f, 18000.f
-};
+  const size_t sizes[] = {RING_SIZE_DEFAULT, 3072, 2048, 1536, 1024, 768, 512, 384, 256, 128};
+  const uint32_t caps[] = {MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT, MALLOC_CAP_8BIT};
+
+  for (size_t ci = 0; ci < (sizeof(caps) / sizeof(caps[0])); ci++) {
+    for (size_t si = 0; si < (sizeof(sizes) / sizeof(sizes[0])); si++) {
+      size_t frames = sizes[si];
+      int16_t* p = (int16_t*)heap_caps_malloc(frames * 2 * sizeof(int16_t), caps[ci]);
+      if (!p) continue;
+      ring = p;
+      ringCapacity = frames;
+      rbHead = 0;
+      rbTail = 0;
+      Serial.print("[MAIN] ");
+      Serial.print((unsigned long)millis());
+      Serial.print(" audio:ringCapacity ");
+      Serial.println((unsigned long)ringCapacity);
+      return true;
+    }
+  }
+  return false;
+}
 
 static int32_t btCallback(Frame *frame, int32_t count) {
+  if (!ring || ringCapacity == 0) {
+    for (int32_t i = 0; i < count; i++) {
+      frame[i].channel1 = 0;
+      frame[i].channel2 = 0;
+    }
+    return count;
+  }
+
   int32_t avail = (int32_t)rbAvail();
   int32_t toSend = min(count, avail);
   for (int32_t i = 0; i < toSend; i++) {
     frame[i].channel1 = ring[rbTail * 2];
     frame[i].channel2 = ring[rbTail * 2 + 1];
-    rbTail = (rbTail + 1) % RING_SIZE;
+    rbTail = (rbTail + 1) % ringCapacity;
   }
   for (int32_t i = toSend; i < count; i++) {
     frame[i].channel1 = 0;
@@ -253,13 +318,12 @@ public:
   bool begin() override { return true; }
   bool stop()  override { return true; }
   bool ConsumeSample(int16_t sample[2]) override {
-    size_t next = (rbHead + 1) % RING_SIZE;
+    if (!ring || ringCapacity == 0) return false;
+    size_t next = (rbHead + 1) % ringCapacity;
     if (next == rbTail) return false;
     ring[rbHead * 2]     = sample[0];
     ring[rbHead * 2 + 1] = sample[1];
     rbHead = next;
-    visRing[visWritePos & (VIS_BUF_LEN - 1)] = (int32_t)((sample[0] + sample[1] ) >> 1);
-    visWritePos++;
     return true;
   }
 };
@@ -278,7 +342,8 @@ static PlayerState playerState = STATE_STOPPED;
 /** Fill ring buffer during TFT/SD/delay (reduces A2DP underrun when changing screen or album). */
 static void audioPumpPlayingMax(int maxLoops) {
   if (playerState != STATE_PLAYING) return;
-  const int target = (RING_SIZE * 3) / 4;
+  if (ringCapacity == 0) return;
+  const int target = (int)((ringCapacity * 3) / 4);
   int loops = 0;
   while ((int)rbAvail() < target && loops < maxLoops) {
     bool ok = false;
@@ -445,19 +510,29 @@ static void addFile(const char* path) {
   playlist[trackCount++] = c;
 }
 
-static void scanDir(File dir, int depth) {
+static void scanDir(File dir, const char* basePath, int depth) {
   if (depth > 2) return;
   while (true) {
     File entry = dir.openNextFile();
     if (!entry) break;
-    if (entry.isDirectory()) {
-      scanDir(entry, depth + 1);
+    const char* name = entry.name();
+    if (!name || !name[0]) {
+      entry.close();
+      audioPumpPlayingMax(16);
+      continue;
+    }
+
+    char fullPath[256];
+    if (!basePath || !basePath[0] || strcmp(basePath, "/") == 0) {
+      snprintf(fullPath, sizeof(fullPath), "/%s", name);
     } else {
-      const char* name = entry.name();
-      if (isMP3(name) || isWAV(name)) {
-        const char* p = entry.path();
-        if (p) addFile(p);
-      }
+      snprintf(fullPath, sizeof(fullPath), "%s/%s", basePath, name);
+    }
+
+    if (entry.isDirectory()) {
+      scanDir(entry, fullPath, depth + 1);
+    } else if (isMP3(name) || isWAV(name)) {
+      addFile(fullPath);
     }
     entry.close();
     audioPumpPlayingMax(16);
@@ -467,7 +542,8 @@ static void scanDir(File dir, int depth) {
 static void scanSD() {
   File root = SD.open("/");
   if (!root || !root.isDirectory()) return;
-  scanDir(root, 0);
+  freePlaylist();
+  scanDir(root, "/", 0);
   root.close();
 }
 
@@ -652,6 +728,7 @@ static int           volumePercent      = 30;
 
 static void applyVolumePercent() {
   volumePercent = constrain(volumePercent, 0, 100);
+  if (!a2dpStarted) return;
   a2dp.set_volume((int)((volumePercent * 127) / 100));
 }
 
@@ -693,6 +770,7 @@ static void stopTrack(bool flushRing = true) {
 
 static void startTrack(int orderIdx, bool gapless) {
   if (trackCount <= 0) return;
+  if (!initAudioRingBuffer()) return;
   int idx = orderIdx;
   if (idx < 0) idx = trackCount - 1;
   if (idx >= trackCount) idx = 0;
@@ -709,11 +787,25 @@ static void startTrack(int orderIdx, bool gapless) {
 
   if (isWAV(path)) {
     wav = new AudioGeneratorWAV();
-    wav->begin(audioFile, audioOut);
+    if (!wav) {
+      stopTrack(true);
+      return;
+    }
+    if (!wav->begin(audioFile, audioOut)) {
+      stopTrack(true);
+      return;
+    }
     currentType = AUDIO_WAV;
   } else {
     mp3 = new AudioGeneratorMP3();
-    mp3->begin(audioFile, audioOut);
+    if (!mp3) {
+      stopTrack(true);
+      return;
+    }
+    if (!mp3->begin(audioFile, audioOut)) {
+      stopTrack(true);
+      return;
+    }
     currentType = AUDIO_MP3;
   }
 
@@ -733,7 +825,7 @@ static void startTrack(int orderIdx, bool gapless) {
   }
 
   int loops = 0;
-  int target = gapless ? (RING_SIZE / 4) : ((RING_SIZE * 3) / 4);
+  int target = gapless ? (int)(ringCapacity / 4) : (int)((ringCapacity * 3) / 4);
   while ((int)rbAvail() < target && loops < 1024) {
     bool ok = false;
     if (currentType == AUDIO_MP3 && mp3 && mp3->isRunning()) ok = mp3->loop();
@@ -782,52 +874,10 @@ static bool getTouchXY(int16_t &tx, int16_t &ty) {
 #include "ui_renderer.h"
 
 static void handleBluetoothPickerTouch(bool* redraw) {
+  if (redraw) *redraw = false;
   if (!displayBacklightOn) return;
-
-  int16_t tx, ty;
-  if (!getTouchXY(tx, ty)) return;
-  noteUserActivity();
-
-  unsigned long now = millis();
-  if (now - lastTouchTime < TOUCH_DEBOUNCE_MS) return;
-  lastTouchTime = now;
-
-  while (ts.touched()) delay(1);
-
-  int fY = footerY();
-  int vis = btPickVisibleSlots();
-  int n = btScanCountSnapshot();
-
-  if (ty >= fY && ty < SCR_H && tx <= 72) {
-    btPickScroll = max(0, btPickScroll - vis);
-    if (redraw) *redraw = true;
-    return;
-  }
-  if (ty >= fY && ty < SCR_H && tx >= 168) {
-    if (btPickScroll + vis < n) btPickScroll += vis;
-    if (redraw) *redraw = true;
-    return;
-  }
-
-  int listBottom = BT_PICK_LIST_Y + vis * BT_PICK_ITEM_H;
-  if (ty < BT_PICK_LIST_Y || ty >= listBottom) return;
-
-  int row = (ty - BT_PICK_LIST_Y) / BT_PICK_ITEM_H;
-  int idx = btPickScroll + row;
-  if (idx < 0 || idx >= n) return;
-
-  portENTER_CRITICAL(&btScanMux);
-  memcpy(btChosenAddr, btScanList[idx].addr, ESP_BD_ADDR_LEN);
-  char picked[BT_NAME_BUF];
-  strncpy(picked, btScanList[idx].name, sizeof(picked) - 1);
-  picked[sizeof(picked) - 1] = '\0';
-  btUserHasChoice = true;
-  portEXIT_CRITICAL(&btScanMux);
-
-  strncpy(btPeerDisplayName, picked, sizeof(btPeerDisplayName) - 1);
-  btPeerDisplayName[sizeof(btPeerDisplayName) - 1] = '\0';
-
-  if (redraw) *redraw = true;
+  if (!uiReadyForPicker) return;
+  lv_timer_handler();
 }
 
 /**
@@ -835,6 +885,58 @@ static void handleBluetoothPickerTouch(bool* redraw) {
  * user taps a device (library connects on the next inquiry hit for that address).
  */
 static void runBluetoothPickerUntilConnected() {
+#if SAFE_MODE_TFT_ONLY
+  btPickScroll = 0;
+  btUserHasChoice = false;
+
+  tft.fillScreen(COL_BG);
+  tft.setTextSize(2);
+  tft.setTextColor(COL_TEXT, COL_BG);
+  tft.setCursor(12, 20);
+  tft.print("SAFE MODE");
+  tft.setTextSize(1);
+  tft.setCursor(12, 52);
+  tft.print("Bluetooth: auto first device");
+
+  int lastShownCount = -1;
+  mainTrace("btpicker:wait-connect-start");
+  while (!a2dp.is_connected()) {
+    rgbLedUpdate();
+    pollBootButton();
+    updateDisplayBacklightTimeout();
+
+    int snap = btScanCountSnapshot();
+    if (snap != lastShownCount) {
+      lastShownCount = snap;
+      tft.fillRect(12, 70, 216, 40, COL_BG);
+      tft.setCursor(12, 70);
+      tft.print("Devices: ");
+      tft.print(snap);
+      tft.setCursor(12, 86);
+      if (btUserHasChoice) tft.print("Connecting...");
+      else tft.print("Scanning...");
+    }
+    delay(20);
+  }
+
+  tft.fillRect(12, 70, 216, 40, COL_BG);
+  tft.setTextSize(2);
+  tft.setTextColor(COL_ACCENT, COL_BG);
+  tft.setCursor(12, 74);
+  tft.print(STR_BT_ON);
+
+  const char* n = a2dp.get_name();
+  if (n && n[0]) {
+    strncpy(btPeerDisplayName, n, sizeof(btPeerDisplayName) - 1);
+    btPeerDisplayName[sizeof(btPeerDisplayName) - 1] = '\0';
+  } else if (!btPeerDisplayName[0]) {
+    strncpy(btPeerDisplayName, STR_BT_LABEL, sizeof(btPeerDisplayName) - 1);
+    btPeerDisplayName[sizeof(btPeerDisplayName) - 1] = '\0';
+  }
+  delay(250);
+  return;
+#endif
+
   /** Small grace period before opening picker screen. */
   const unsigned long kPickerShowMs = 2000;
   unsigned long tStart = millis();
@@ -879,6 +981,8 @@ static void runBluetoothPickerUntilConnected() {
     delay(15);
   }
 
+  mainTrace("btpicker:connected");
+
   if (showedUi) {
     tft.fillScreen(COL_BG);
     tft.setTextSize(2);
@@ -898,146 +1002,89 @@ static void runBluetoothPickerUntilConnected() {
     strncpy(btPeerDisplayName, STR_BT_LABEL, sizeof(btPeerDisplayName) - 1);
     btPeerDisplayName[sizeof(btPeerDisplayName) - 1] = '\0';
   }
+  mainTrace("btpicker:done");
 }
 
 static void handleTouch() {
+#if SAFE_MODE_TFT_ONLY
+  return;
+#endif
+  if (!displayBacklightOn) return;
+  lv_timer_handler();
+}
+
+static unsigned long safeUiLastMs = 0;
+
+static void drawSafeStatus() {
   if (!displayBacklightOn) return;
 
-  int16_t tx, ty;
-  if (!getTouchXY(tx, ty)) return;
-  noteUserActivity();
+  tft.fillScreen(COL_BG);
+  tft.setTextSize(2);
+  tft.setTextColor(COL_TEXT, COL_BG);
+  tft.setCursor(10, 8);
+  tft.print("SAFE PLAYER");
 
-  unsigned long now = millis();
-  if (now - lastTouchTime < TOUCH_DEBOUNCE_MS) return;
-  lastTouchTime = now;
+  tft.setTextSize(1);
+  tft.setCursor(10, 38);
+  tft.print("BT: ");
+  tft.print(a2dp.is_connected() ? "ON" : "OFF");
+  tft.setCursor(72, 38);
+  tft.print(btPeerDisplayName[0] ? btPeerDisplayName : STR_BT_LABEL);
 
-  {
-    unsigned long rel = millis();
-    while (ts.touched()) {
-      audioPumpPlayingMax(120);
-      if (millis() - rel > 500) break;
-      delay(1);
-    }
+  tft.setCursor(10, 56);
+  tft.print("State: ");
+  if (playerState == STATE_PLAYING) tft.print("PLAY");
+  else if (playerState == STATE_PAUSED) tft.print("PAUSE");
+  else tft.print("STOP");
+
+  tft.setCursor(10, 74);
+  tft.print("Vol: ");
+  tft.print(volumePercent);
+  tft.print('%');
+
+  tft.setCursor(10, 92);
+  tft.print("Track: ");
+  if (trackCount > 0) {
+    tft.print(currentTrack + 1);
+    tft.print('/');
+    tft.print(trackCount);
+  } else {
+    tft.print('-');
   }
 
-  if (screenMode == SCREEN_BROWSER) {
-    if (browseLevel == BROWSE_TRACKS && ty < browseHeaderH && tx < 64) {
-      browseLevel = BROWSE_ALBUMS;
-      browseAlbumIdx = -1;
-      browseTrackScroll = 0;
-      drawBrowser();
-      return;
-    }
-
-    if (trackCount > 0 &&
-        ty >= BROWSE_PLAYER_BTN_Y && ty < BROWSE_PLAYER_BTN_Y + BROWSE_PLAYER_BTN_H &&
-        tx >= BROWSE_PLAYER_BTN_X && tx < BROWSE_PLAYER_BTN_X + BROWSE_PLAYER_BTN_W) {
-      screenMode = SCREEN_PLAYER;
-      drawPlayer();
-      return;
-    }
-
-    if (trackCount > 0 &&
-        ty >= BROWSE_PATH_PLAY_BTN_Y && ty < BROWSE_PATH_PLAY_BTN_Y + BROWSE_PATH_PLAY_BTN_H &&
-        tx >= BROWSE_PATH_PLAY_BTN_X && tx < BROWSE_PATH_PLAY_BTN_X + BROWSE_PATH_PLAY_BTN_W) {
-      screenMode = SCREEN_PLAYER;
-      drawPlayer();
-      return;
-    }
-
-    int fY = footerY();
-    int vis = visibleSlots();
-    int btnY0 = fY;
-    int btnY1 = fY + browseFooterH;
-    int itemCount = (browseLevel == BROWSE_ALBUMS) ? albumCount : browseTrackCount;
-
-    // PREV
-    if (ty >= btnY0 && ty <= btnY1 && tx >= 0 && tx <= 72) {
-      if (browseLevel == BROWSE_ALBUMS)
-        albumScroll = max(0, albumScroll - vis);
-      else
-        browseTrackScroll = max(0, browseTrackScroll - vis);
-      drawBrowser();
-      return;
-    }
-    // NEXT
-    if (ty >= btnY0 && ty <= btnY1 && tx >= 168 && tx <= SCR_W) {
-      if (browseLevel == BROWSE_ALBUMS) {
-        if (albumScroll + vis < albumCount) albumScroll += vis;
-      } else {
-        if (browseTrackScroll + vis < browseTrackCount) browseTrackScroll += vis;
-      }
-      drawBrowser();
-      return;
-    }
-
-    int listTop = browseListY;
-    int listBottom = browseListY + vis * browseItemH;
-    if (ty < listTop || ty >= listBottom) return;
-    int indexInView = (ty - browseListY) / browseItemH;
-    int scroll = (browseLevel == BROWSE_ALBUMS) ? albumScroll : browseTrackScroll;
-    int idx = scroll + indexInView;
-    if (idx < 0 || idx >= itemCount) return;
-
-    int y = browseListY + indexInView * browseItemH;
-    tft.fillRoundRect(6, y + 1, SCR_W - 12, browseItemH - 3, 5, COL_BTN_ACT);
-    {
-      unsigned long t0 = millis();
-      while (millis() - t0 < 50) audioPumpPlayingMax(200);
-    }
-
-    if (browseLevel == BROWSE_ALBUMS) {
-      browseAlbumIdx = idx;
-      loadBrowseAlbumTracks(albums[idx]);
-      browseLevel = BROWSE_TRACKS;
-      browseTrackScroll = 0;
-      drawBrowser();
-      return;
-    }
-
-    if (playerState != STATE_STOPPED) stopTrack(true);
-    startPlayingFromPlaylistIndex(browseTrackIndices[idx]);
-    screenMode = SCREEN_PLAYER;
-    drawPlayer();
-  } else { // SCREEN_PLAYER
-    // List: back to folders; playback continues
-    if (ty >= PL_BACK_BTN_Y && ty < PL_BACK_BTN_Y + PL_BACK_BTN_H &&
-        tx >= PL_BACK_BTN_X && tx < PL_BACK_BTN_X + PL_BACK_BTN_W) {
-      screenMode = SCREEN_BROWSER;
-      drawBrowser();
-      audioPumpPlayingMax(512);
-      return;
-    }
-
-    // Volume row (10% per tap)
-    if (ty >= PL_VOLUME_Y && ty <= PL_VOLUME_Y + 32) {
-      if (tx < 68) {
-        volumePercent -= 10;
-        applyVolumePercent();
-        drawVolumeControls();
-        return;
-      } else if (tx >= 172) {
-        volumePercent += 10;
-        applyVolumePercent();
-        drawVolumeControls();
-        return;
-      }
-    }
-
-    // controls (center area)
-    int y = PL_TRANSPORT_Y;
-    if (ty >= y && ty <= y + 44) {
-      if (tx < 68) prevTrack();
-      else if (tx < 172) togglePause();
-      else nextTrack();
-      drawPlayer();
-    }
+  char title[42] = {0};
+  if (trackCount > 0 && currentTrack >= 0 && currentTrack < trackCount) {
+    getDisplayName(playlist[currentTrack], title, sizeof(title));
+  } else {
+    strncpy(title, STR_NO_TRACK, sizeof(title) - 1);
   }
+  tft.setCursor(10, 114);
+  tft.print(title);
+
+  uint32_t el = elapsedPlaybackSec();
+  char tEl[16], tTot[16];
+  formatTimeHMS(tEl, sizeof(tEl), el);
+  if (cachedDurationSec > 0) formatTimeHMS(tTot, sizeof(tTot), cachedDurationSec);
+  else strncpy(tTot, STR_TIME_UNKNOWN, sizeof(tTot) - 1);
+  tTot[sizeof(tTot) - 1] = '\0';
+
+  tft.setCursor(10, 132);
+  tft.print("Time: ");
+  tft.print(tEl);
+  tft.print(" / ");
+  tft.print(tTot);
+
+  tft.setCursor(10, 302);
+  tft.print("BOOT: backlight, autoplay enabled");
 }
 
 // ── Setup / Loop ────────────────────────────────────────────
 void setup() {
   delay(500);
+
+  Serial.begin(115200);
+  delay(40);
+  mainTrace("setup:start");
 
   rgbLedInit();
 
@@ -1047,6 +1094,7 @@ void setup() {
   pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
 
   tft.init();
+  mainTrace("setup:tft-init");
   // "Gamma" adjustment for the ILI9341_2 (some CYD boards have washed-out colors)
   // Reported common sequence to improve quality after inversion/initial gamma.
   tft.writecommand(0x26); // ILI9341_GAMMASET
@@ -1061,35 +1109,108 @@ void setup() {
   touchSPI.begin(TOUCH_CLK, TOUCH_MISO, TOUCH_MOSI, TOUCH_CS);
   ts.begin(touchSPI);
   ts.setRotation(0);
+  mainTrace("setup:touch-init");
+
+// Initialize LVGL early to avoid memory fragmentation after BT startup.
+#if !SAFE_MODE_TFT_ONLY
+  mainTrace("setup:lv-init-call");
+  uiLvInit();
+  uiReadyForPicker = true;
+  mainTrace("setup:lv-init-done");
+#endif
 
   if (!SD.begin(SD_CS)) {
+    mainTrace("setup:sd-fail");
     tft.setTextColor(TFT_RED, COL_BG);
     tft.setTextSize(2);
     tft.setCursor(20, 90);
     tft.print(STR_SD_FAILED);
     while (1) delay(1000);
   }
+  mainTrace("setup:sd-ok");
 
   audioOut = new RingBufOutput();
+  mainTrace("setup:audioOut-ok");
+
+  mainTrace("setup:applyVolume-call");
   applyVolumePercent();
+  mainTrace("setup:applyVolume-done");
 
+  mainTrace("setup:startupScreen-call");
   drawStartupScreen();
+  mainTrace("setup:startupScreen-done");
 
-  // Always show device picker on boot (no auto-reconnect to a previously saved speaker).
-  a2dp.set_auto_reconnect(false);
-  a2dp.clean_last_connection();
-  a2dp.set_volume(64);
+  // BT boot strategy: picker mode uses fresh scan; default mode uses auto reconnect.
+  if (BT_USE_DEVICE_PICKER) {
+    mainTrace("setup:a2dp:set_auto_reconnect-call");
+    a2dp.set_auto_reconnect(false);
+    mainTrace("setup:a2dp:set_auto_reconnect-done");
+    if (!A2DP_CONSERVATIVE_INIT) {
+      mainTrace("setup:a2dp:clean_last_connection-call");
+      a2dp.clean_last_connection();
+      mainTrace("setup:a2dp:clean_last_connection-done");
+    }
+  } else {
+    mainTrace("setup:a2dp:set_auto_reconnect-call");
+    a2dp.set_auto_reconnect(true);
+    mainTrace("setup:a2dp:set_auto_reconnect-done");
+  }
+
+  mainTrace("setup:a2dp:set_data_callback-call");
   a2dp.set_data_callback_in_frames(btCallback);
-  a2dp.set_ssid_callback(btScanSsidCallback);
-  a2dp.start();
+  mainTrace("setup:a2dp:set_data_callback-done");
 
-  runBluetoothPickerUntilConnected();
+  if (BT_USE_DEVICE_PICKER) {
+    mainTrace("setup:a2dp:set_ssid_callback-call");
+    a2dp.set_ssid_callback(btScanSsidCallback);
+    mainTrace("setup:a2dp:set_ssid_callback-done");
+  }
+
+  mainTrace("setup:a2dp:start-call");
+  a2dp.start();
+  mainTrace("setup:a2dp:start-done");
+
+  a2dpStarted = true;
+  mainTrace("setup:a2dp:applyVolume-call");
+  applyVolumePercent();
+  mainTrace("setup:a2dp:applyVolume-done");
+  mainTrace("setup:a2dp-start");
+
+  if (BT_USE_DEVICE_PICKER) {
+    runBluetoothPickerUntilConnected();
+    mainTrace("setup:bt-connected");
+  } else {
+    mainTrace("setup:bt-picker-disabled");
+    btUserHasChoice = false;
+    if (!btPeerDisplayName[0]) {
+      strncpy(btPeerDisplayName, STR_BT_LABEL, sizeof(btPeerDisplayName) - 1);
+      btPeerDisplayName[sizeof(btPeerDisplayName) - 1] = '\0';
+    }
+  }
+
+  mainTrace("setup:ring-call");
+  if (!initAudioRingBuffer()) {
+    mainTrace("setup:ring-fail");
+    tft.fillScreen(COL_BG);
+    tft.setTextColor(TFT_RED, COL_BG);
+    tft.setTextSize(2);
+    tft.setCursor(12, 90);
+    tft.print("No RAM for audio");
+    while (1) delay(1000);
+  }
+  mainTrace("setup:ring-ok");
   btConnected = a2dp.is_connected();
   rgbPrevBt = btConnected;
   rgbPrevPlaying = (playerState == STATE_PLAYING);
 
   scanSD();
+  mainTrace("setup:scanSD-done");
+  Serial.print("[MAIN] ");
+  Serial.print((unsigned long)millis());
+  Serial.print(" setup:trackCount ");
+  Serial.println(trackCount);
   if (trackCount == 0) {
+    mainTrace("setup:no-music");
     tft.setTextColor(TFT_YELLOW, COL_BG);
     tft.setTextSize(2);
     tft.setCursor(20, 120);
@@ -1100,15 +1221,26 @@ void setup() {
     }
   }
   scanAlbums();
+  mainTrace("setup:scanAlbums-done");
   browseLevel = BROWSE_ALBUMS;
   browseAlbumIdx = -1;
   browseTrackScroll = 0;
-  screenMode = SCREEN_BROWSER;
+  screenMode = SAFE_MODE_TFT_ONLY ? SCREEN_PLAYER : SCREEN_BROWSER;
   albumScroll = 0;
+
+#if SAFE_MODE_TFT_ONLY
+  startTrack(0, false);
+  drawSafeStatus();
+  mainTrace("setup:safe-ui-ready");
+#else
+  mainTrace("setup:drawBrowser-call");
   drawBrowser();
+  mainTrace("setup:drawBrowser-done");
+#endif
 
   lastUserActivityMs = millis();
   mainPlayerUiReady = true;
+  mainTrace("setup:done");
 }
 
 void loop() {
@@ -1118,22 +1250,36 @@ void loop() {
 
   if (displayWakeNeedsRedraw) {
     displayWakeNeedsRedraw = false;
+#if SAFE_MODE_TFT_ONLY
+    drawSafeStatus();
+#else
+  mainTrace("loop:wake-redraw");
     if (screenMode == SCREEN_PLAYER) drawPlayer();
     else drawBrowser();
+#endif
   }
 
   if (displayBacklightOn) {
+#if SAFE_MODE_TFT_ONLY
+    unsigned long now = millis();
+    if (now - safeUiLastMs >= 700) {
+      safeUiLastMs = now;
+      drawSafeStatus();
+    }
+#else
     if (screenMode == SCREEN_PLAYER &&
         (playerState == STATE_PLAYING || playerState == STATE_PAUSED)) {
       unsigned long now = millis();
       if (now - lastProgressUiMs >= 450) {
         lastProgressUiMs = now;
+        mainTrace("loop:progress-redraw");
         drawPlayerProgressArea();
       }
     }
 
     if (screenMode == SCREEN_PLAYER)
       updateVisualizerAnimation();
+#endif
   }
 
   if (playerState == STATE_PLAYING) {
@@ -1143,7 +1289,7 @@ void loop() {
 
     if (decoderAlive) {
       int loops = 0;
-      int target = (RING_SIZE * 3) / 4;
+      int target = (int)((ringCapacity * 3) / 4);
       bool loopFailed = false;
       while ((int)rbAvail() < target && loops < 1024) {
         bool ok = false;
@@ -1163,7 +1309,11 @@ void loop() {
       // Decoder stopped — wait for the ring buffer to drain before switching tracks with fewer glitches.
       if (rbAvail() < 200) {
         nextTrack(true);
+#if SAFE_MODE_TFT_ONLY
+        drawSafeStatus();
+#else
         if (screenMode == SCREEN_PLAYER && displayBacklightOn) drawPlayer();
+#endif
       }
     }
   }
